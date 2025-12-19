@@ -1,0 +1,261 @@
+<!DOCTYPE html><html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Insta Chat Analyzer</title>
+    <link rel="stylesheet" href="https://pyscript.net/releases/2025.8.1/core.css">
+    <script type="module" src="https://pyscript.net/releases/2025.8.1/core.js"></script>
+
+    <py-config>
+        packages = ["tzdata"]<!--,"datetime","dataclasses","typing","locale","zoneinfo","re"]-->
+    </py-config>
+
+</head>
+<body>
+    <input type="file" id="file-input" />
+    <button id="run-btn">Ausführen</button>
+    <pre id="output"></pre>
+
+    <script type="py">
+from datetime import datetime, date
+import re
+from typing import Callable, Dict, Iterable, Iterator, Protocol, Any, List, Tuple, Set
+from dataclasses import dataclass
+import locale
+from zoneinfo import ZoneInfo
+
+
+@dataclass
+class Message:
+    type: str
+    date: datetime
+    content: str
+    author: str
+    reactions: List[Tuple[str,str]]
+    edited: bool
+
+class Reader(Protocol):
+    def read(self, file_str) -> Iterable[Message]: ...
+
+class ReadHTML:
+    # Regexes
+    RE_FLAGS = re.DOTALL | re.MULTILINE
+    RE_ENTRY: re.Pattern = re.compile(r'<div class="pam _3-95 _2ph- _a6-g uiBoxWhite noborder">\s*<h2 class="_3-95 _2pim _a6-h _a6-i">(?P<author>.*?)<\/h2>\s*?<div class="_3-95 _a6-p">\s*(?P<body>.*?<\/div>)\s*<\/div>\s*<div class="_3-94 _a6-o">(?P<date>.*?)<\/div>\s*?<\/div>',RE_FLAGS)
+    RE_REACTION_LI: re.Pattern = re.compile(r"<li><span>(?P<reaction>.*?)<\/span><\/li>",RE_FLAGS)
+    RE_ATTACHMENT: re.Pattern = re.compile(r"<div>\s*<div><\/div>\s*<div>(?:.*? sent an attachment||.*? has?t einen Anhang gesendet)\.<\/div>.*?(<ul.*?>\s*(?P<reaction>.*?)\s*<\/ul>)?",RE_FLAGS)
+    RE_NICKNAME_CHANGE: re.Pattern = re.compile(r"<div>(?P<content>.*? set your nickname to .*?\.)<\/div>",RE_FLAGS)
+    RE_MESSAGE: re.Pattern = re.compile(r"<div>\s*<div><\/div>\s*<div>(?P<message>.*?(?P<edited>\(edited\))?)<\/div>.*?(<ul.*?>\s*(?P<reaction>.*?)\s*<\/ul>)?",RE_FLAGS)
+    RE_VIDEO_NORMAL: re.Pattern = re.compile(r"<div><video.*?(<ul.*?>\s*(?P<reaction>.*?)\s*<\/ul>)?",RE_FLAGS)
+    RE_VIDEO_ONCE: re.Pattern = re.compile(r"<div>\s*(?:<div><\/div>\s*){4}<\/div>",RE_FLAGS)
+    RE_IMG: re.Pattern = re.compile(r'<div><a target="_blank".*?(<ul.*?>\s*(?P<reaction>.*?)\s*<\/ul>)?', RE_FLAGS)
+    RE_AUDIO: re.Pattern = re.compile(r"<div><audio.*?(<ul.*?>\s*(?P<reaction>.*?)\s*<\/ul>)?",RE_FLAGS)
+
+    # andere Konstanten
+    # Deutsch → Englisch Mapping
+    months: Dict[str,str] = {
+        "Jan.": "Jan", "Feb.": "Feb", "März": "Mar", "Mrz.": "Mar",
+        "Apr.": "Apr", "Mai": "May", "Jun.": "Jun", "Jul.": "Jul",
+        "Aug.": "Aug", "Sept.": "Sep", "Okt.": "Oct",
+        "Nov.": "Nov", "Dez.": "Dec"
+    }
+    source_tz = ZoneInfo("US/Pacific")
+    target_tz = ZoneInfo("Europe/Berlin")
+
+    #def __init__(self, filename: str) -> None:
+    #    self.filename = filename
+
+    def read(self, file_str) -> List[Message]:
+        #file: str = ""
+        #with open(self.filename,"r",encoding="utf-8") as f:
+        #    file = f.read()
+
+        return self._parse_messages(file_str)
+    
+    def _parse_date_str(self, date_str: str) -> datetime:
+        # Ersetze nur das Monatswort am Anfang
+        for de, en in self.months.items():
+            if date_str.startswith(de):
+                date_str = date_str.replace(de, en, 1)
+                break
+        date: datetime = datetime.strptime(date_str, "%b %d, %Y %I:%M %p")
+        date = date.replace(tzinfo=self.source_tz)
+        return date.astimezone(self.target_tz)
+
+    def _parse_messages(self, file: str) -> List[Message]:
+        # Holen aller Einträge unabhängig von Typ etc
+        # Enthält die Gruppen: author, body, date
+
+        messages: List[Message] = [] 
+        entries: Iterator[re.Match] = re.finditer(self.RE_ENTRY, file)
+        for entry in entries:
+            author: str = entry.group("author")
+            
+            date_str: str = entry.group("date")
+            date = self._parse_date_str(date_str)
+
+            body_str: str = entry.group("body")
+            result_tup = self._parse_body(body_str)
+            if result_tup:
+                type,content,reactions,edited = result_tup
+                if type != "message_liked":
+                    messages.append(Message(type,date,content,author,reactions,edited))
+        
+
+        return messages
+
+
+    def _parse_body(self, body_str: str) -> Any:
+        
+        #? Für Multimedia Ressourcen als Link in content packen?
+
+        content: str = ""
+        reactions: List[Tuple[str,str]] = []
+        type: str = ""
+        edited: bool = False
+        match_obj: re.Match | None = None
+
+        if match_obj := self.RE_ATTACHMENT.search(body_str):
+            type = "attachment"
+            content = ""
+
+        elif match_obj := self.RE_NICKNAME_CHANGE.search(body_str):
+            type = "nickname_change"
+            content = match_obj.group("content")
+
+        elif match_obj := self.RE_VIDEO_NORMAL.search(body_str):
+            type = "video_normal"
+            content = ""
+        
+        elif match_obj := self.RE_VIDEO_ONCE.search(body_str):
+            type = "video_once"
+            content = ""
+
+        elif match_obj := self.RE_IMG.search(body_str):
+            type = "image"
+            content = ""
+        
+        elif match_obj := self.RE_AUDIO.search(body_str):
+            type = "audio"
+            content = "" 
+        
+        elif match_obj := self.RE_MESSAGE.search(body_str):
+            type = "message"
+            content = match_obj.group("message")
+            if content == "Liked a message":
+                type += "_liked"
+            edited = True if match_obj.group("edited") else False
+
+        else:
+            print(f"WARNING: Content of entry does not match with any pattern: {body_str}")
+        
+        if not match_obj:
+            return None
+        
+        # ❤AIE --> List[Tuple[str,str]]
+        if "reaction" in match_obj.re.groupindex and (reaction_str := match_obj.group("reaction")):
+            reactions.extend(self._parse_reactions(reaction_str))
+        
+        return type,content,reactions,edited
+
+    def _parse_reactions(self, reaction_str: str) -> List[Tuple[str,str]]:
+        result: List[Tuple[str,str]] = []
+        
+        for reaction_elem_match in self.RE_REACTION_LI.finditer(reaction_str):
+            reaction_elem_match_str: str = reaction_elem_match.group("reaction")
+            result.append((reaction_elem_match_str[0],reaction_elem_match_str[1:]))
+        
+        return result
+
+
+
+
+class DataProcessor(Protocol):
+    def process(self, data: Iterable[Message], authors: Iterable[str]) -> Any:
+        ...
+
+class HTML_OutputProcessor:
+    def __init__(self) -> None:
+        self._data: Iterable[Message] = []
+        self._authors: Set[str] = set()
+        self.result = ""
+
+    def add_to_result(self,text=""):
+        self.result += f"{text}\n"
+
+    def process(self, data, authors) -> Any:
+        self._data = data
+        self._authors = authors
+
+        self.add_to_result(f"=== CHAT ZWISCHEN {', '.join(list(self._authors)[:-1])} und {list(self._authors)[-1]} ===")
+        self.add_to_result()
+        self._author_distribution("NACHRICHTEN (IGNORE EDITED)",lambda x: x.type=='message' and not x.edited)
+        self._author_distribution("REELS & Beiträge",lambda x: x.type=='attachment')
+        self._author_distribution("Audios",lambda x: x.type=='audio')
+        self._author_distribution("Videos (normal)",lambda x: x.type=='video_normal')
+        self._author_distribution("Videos (ein mal)",lambda x: x.type=='video_once')
+        self._author_distribution("Bilder (inkl. GIFS und Sticker)",lambda x: x.type=='image')
+        self._author_distribution("Namensänderungen",lambda x: x.type=='nickname_change')
+
+        print(self.result)
+        display(self.result,target="#output")    
+
+    def _author_distribution(self, title: str, condition: Callable):
+        if (len(list(self._data)) == 0):
+            self.add_to_result("ERROR")
+            return
+        
+        _total_cond_li: List[Message] = [i for i in self._data if condition(i)]
+        
+        self.add_to_result()
+        self.add_to_result(f"--- {title.upper()} ---")
+        self.add_to_result(f"Total: {len(_total_cond_li)}")
+        for author in self._authors:
+            self.add_to_result(f"{author}: {len([i for i in _total_cond_li if i.author==author])}")
+        self.add_to_result()
+
+class DataPipeLine:
+    def __init__(self, file_as_str, reader: Reader, data_processor: DataProcessor) -> None:
+        self._reader = reader
+        self._processor = data_processor
+        self._data: Iterable[Message] = []
+        self._authors: Set[str] = set()
+        self._file_as_str = file_as_str
+
+    def run(self) -> None:
+        self._data = self._reader.read(self._file_as_str)
+        self._authors = set([i.author for i in self._data])
+        self._processor.process(self._data,self._authors)
+
+from pyscript import when, display
+from io import BytesIO
+import asyncio
+file = None
+@when("change","#file-input")
+async def handle_input(event):
+    global file
+    file = event.target.files.item(0)
+    array_buffer = await file.arrayBuffer()
+        
+    # Konvertieren des ArrayBuffers in ein Python-Bytes-Objekt
+    file_bytes = array_buffer.to_bytes()
+    file = BytesIO(file_bytes).read1().decode()
+
+    #print(file)
+
+@when("click","#run-btn")
+def handle_file(event):
+    if file:
+        DataPipeLine(file,ReadHTML(),HTML_OutputProcessor()).run()
+    else:
+        display("ERROR")
+
+
+
+# Hängt den Event-Handler direkt an das DOM-Element
+
+#js.document.getElementById("file-input").onchange = handle_file
+
+    </script>
+
+</body>
+</html>
